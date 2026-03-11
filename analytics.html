@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DB_PATH = BASE_DIR / "data" / "app.db"
+
+
+def _connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def init_db(db_path: Path = DB_PATH) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS demos (
+                id TEXT PRIMARY KEY,
+                slug TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analytics_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                demo_id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                step_id TEXT,
+                step_index INTEGER,
+                hotspot_id TEXT,
+                event_meta TEXT,
+                ts_client TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(analytics_events);").fetchall()}
+        if "event_meta" not in columns:
+            conn.execute("ALTER TABLE analytics_events ADD COLUMN event_meta TEXT;")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analytics_demo_slug ON analytics_events(demo_id, slug);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analytics_event_name ON analytics_events(event_name);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analytics_session ON analytics_events(session_id);"
+        )
+        conn.commit()
+
+
+def insert_demo(demo: Dict[str, Any], db_path: Path = DB_PATH) -> None:
+    payload = json.dumps(demo, separators=(",", ":"))
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO demos (id, slug, title, data_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                demo["id"],
+                demo["slug"],
+                demo.get("title", "Untitled Demo"),
+                payload,
+                demo["createdAt"],
+                demo["updatedAt"],
+            ),
+        )
+        conn.commit()
+
+
+def update_demo(demo: Dict[str, Any], db_path: Path = DB_PATH) -> None:
+    payload = json.dumps(demo, separators=(",", ":"))
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE demos
+            SET title = ?, data_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                demo.get("title", "Untitled Demo"),
+                payload,
+                demo["updatedAt"],
+                demo["id"],
+            ),
+        )
+        conn.commit()
+
+
+def fetch_demo_by_slug(slug: str, db_path: Path = DB_PATH) -> Optional[Dict[str, Any]]:
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT data_json FROM demos WHERE slug = ?", (slug,)
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["data_json"])
+
+
+def fetch_demo_by_id(demo_id: str, db_path: Path = DB_PATH) -> Optional[Dict[str, Any]]:
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT data_json FROM demos WHERE id = ?", (demo_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["data_json"])
+
+
+def fetch_all_demos(db_path: Path = DB_PATH) -> list[Dict[str, Any]]:
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT data_json FROM demos ORDER BY updated_at DESC"
+        ).fetchall()
+        return [json.loads(row["data_json"]) for row in rows]
+
+
+def delete_demo(demo_id: str, db_path: Path = DB_PATH) -> bool:
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM analytics_events WHERE demo_id = ?", (demo_id,))
+        cursor = conn.execute("DELETE FROM demos WHERE id = ?", (demo_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def insert_analytics_event(event: Dict[str, Any], db_path: Path = DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO analytics_events (
+                demo_id,
+                slug,
+                session_id,
+                event_name,
+                step_id,
+                step_index,
+                hotspot_id,
+                event_meta,
+                ts_client,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["demo_id"],
+                event["slug"],
+                event["session_id"],
+                event["event_name"],
+                event.get("step_id"),
+                event.get("step_index"),
+                event.get("hotspot_id"),
+                event.get("event_meta"),
+                event.get("ts_client"),
+                event["created_at"],
+            ),
+        )
+        conn.commit()
+
+
+def fetch_analytics_events_for_demo(demo_id: str, db_path: Path = DB_PATH) -> list[Dict[str, Any]]:
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                demo_id,
+                slug,
+                session_id,
+                event_name,
+                step_id,
+                step_index,
+                hotspot_id,
+                event_meta,
+                ts_client,
+                created_at
+            FROM analytics_events
+            WHERE demo_id = ?
+            ORDER BY id ASC
+            """,
+            (demo_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]

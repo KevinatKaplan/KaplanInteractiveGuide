@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Interactive Guide MVP</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Merriweather:wght@700&family=Noto+Sans:wght@400;600;700&family=Open+Sans:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/brand.css?v={{ asset_v }}" />
+    <link rel="stylesheet" href="/static/app.css?v={{ asset_v }}" />
+  </head>
+  <body class="landing-page">
+    <div class="landing-shell">
+      <header class="landing-header">
+        <a href="/" class="landing-brand">
+          <img src="/static/kaplan-pathways-logo.svg" alt="Kaplan International Pathways" />
+        </a>
+        <nav class="landing-nav" aria-label="Primary">
+          <a href="/builder">Builder</a>
+          <a href="/showcase/all">Showcase</a>
+          <a href="/admin">Admin</a>
+        </nav>
+      </header>
+
+      <section class="landing-hero" aria-label="Interactive demo platform">
+        <div class="landing-content">
+          <div class="landing-kicker">Interactive Guide Platform</div>
+          <h1>Create guided product demos that keep learners on track.</h1>
+          <p>
+            Build chapter-based walkthroughs from screenshots or recordings, then publish with guided hotspots,
+            progress tracking, and completion analytics.
+          </p>
+          <div class="cta-row">
+            <a class="btn primary" href="/builder">Start Building</a>
+            <a class="btn ghost" href="/demo/platform-sample">View Sample</a>
+            <a class="btn ghost" href="/showcase/all">Browse Showcase</a>
+          </div>
+          <div class="landing-stat-row" aria-label="Capabilities">
+            <div class="landing-stat">
+              <strong>Strict Guidance</strong>
+              <span>Step-by-step hotspots</span>
+            </div>
+            <div class="landing-stat">
+              <strong>Chapters</strong>
+              <span>Clear learning progress</span>
+            </div>
+            <div class="landing-stat">
+              <strong>Analytics</strong>
+              <span>Completion and feedback</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="landing-preview" aria-hidden="true">
+          <div class="preview-window">
+            <div class="preview-topbar">
+              <span></span><span></span><span></span>
+              <p>Interactive Demo Preview</p>
+            </div>
+            <div class="preview-body">
+              <aside>
+                <h3>Outline</h3>
+                <ul>
+                  <li class="active">Open Redirect Settings</li>
+                  <li>Edit Existing Redirect</li>
+                  <li>Create and Validate Redirect</li>
+                </ul>
+              </aside>
+              <div class="preview-canvas">
+                <div class="preview-hotspot"></div>
+                <div class="preview-tooltip">
+                  <div class="preview-tooltip-kicker">Step</div>
+                  <strong>Enter New Redirect Values</strong>
+                  <p>Type old and new URLs, then click Add Redirect.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="note">Tip: Use Admin to jump directly into demo editing with one click.</div>
+    </div>
+  </body>
+</html>

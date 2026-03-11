@@ -1,0 +1,188 @@
+# Interactive Guide MVP (FastAPI)
+
+## Project structure
+
+- `app/main.py`: FastAPI app + routes.
+- `app/models.py`: Pydantic schema for demo payloads.
+- `app/db.py`: SQLite helpers.
+- `app/storage/interface.py`: storage interfaces (`DemoStore`, `MediaStore`).
+- `app/storage/sqlite_store.py`: local demo store implementation.
+- `app/storage/local_media.py`: local upload implementation.
+- `app/templates/`: builder/player templates.
+- `app/static/`: JS/CSS for builder/player.
+- `tests/`: API smoke tests and Playwright script.
+
+## Run locally (Windows PowerShell)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python -m uvicorn app.main:app --reload
+```
+
+Open:
+- Builder: `http://127.0.0.1:8000/builder`
+- Demo player: `http://127.0.0.1:8000/demo/<slug>`
+- Seeded sample: `http://127.0.0.1:8000/demo/platform-sample`
+- Admin dashboard: `http://127.0.0.1:8000/admin`
+
+## Run on Replit
+
+```bash
+python -m pip install -r requirements.txt
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+## Environment variables
+
+- `STORAGE_MODE` (default: `local`)
+- `DEMO_DB_PATH` (default: `data/app.db`)
+- `UPLOAD_DIR` (default: `uploads/`)
+- `MAX_UPLOAD_BYTES` (default: `26214400` = 25MB)
+- `CORS_ALLOW_ORIGINS` (CSV; defaults to localhost origins)
+- `OPENAI_API_KEY` (optional; enables AI auto-build for video demos)
+- `AUTOBUILD_MODEL` (optional; default `gpt-4o-mini`)
+- `ADMIN_PASSWORD` (default: `kaplanlife`)
+- `ADMIN_SECRET` (default: `interactive-guide-local`)
+- `ADMIN_COOKIE_NAME` (default: `ig_admin_session`)
+
+## Testing
+
+API smoke tests:
+
+```powershell
+.\.venv\Scripts\python -m pytest -q
+```
+
+Playwright (headful Chromium):
+
+```powershell
+.\.venv\Scripts\python tests\playwright_hotspot_preview.py
+```
+
+## Milestone 1 features
+
+- Drag/drop reorder for steps in the builder.
+- Duplicate and delete step actions.
+- Optional chapters with quick jump.
+- Hotspot style per step (`click` or `highlight`).
+- Hint type per step (`click`, `arrow`, `none`).
+- Tooltip position per step (`auto`, `right`, `left`, `bottom`, `top`).
+
+## Milestone 1.5 features
+
+- Three-pane builder workflow with sticky left/right panels.
+- Persistent top bar with demo title, slug, save status, preview, and JSON import/export.
+- Manual save workflow (autosave removed to avoid typing interruptions).
+- Undo/redo for hotspot edits and step reordering.
+- Keyboard shortcuts:
+  - `Ctrl/Cmd+S` save
+  - `Ctrl/Cmd+Z` undo
+  - `Ctrl/Cmd+Shift+Z` redo
+  - Arrow keys hotspot nudge (`Shift` = 10px)
+- Hotspot editor upgrades: resize handles, snap-to-edges toggle, focus mode, and test-hotspot mode.
+- Demo `status` support (`draft` / `published`), plus API import/export endpoints.
+- `New Demo` button in builder top bar for starting a clean draft quickly.
+- `Auto Build (AI)` button for video screens:
+  - captures storyboard frames client-side
+  - sends them to `POST /api/demos/{id}/auto-build`
+  - generates draft chapters + steps + hotspots (uses OpenAI when API key is set, fallback heuristic otherwise).
+- `Export For Codex` + `Import Codex Draft` workflow (no API key required):
+  - export storyboard package JSON from a video screen
+  - include timeline key markers + existing step markers in the export
+  - paste/upload package in Codex and ask for `chapters` + `steps` draft JSON
+  - import draft via builder, which calls `POST /api/demos/{id}/auto-build/from-draft`
+  - applies generated chapters/steps into the current demo.
+- Video timeline marker tooling in builder:
+  - add key markers at current playback time
+  - clear key markers per video screen
+  - marker rail shows step timestamps and key action markers
+  - clicking a marker jumps playback to that exact time (and selects linked step markers).
+
+## Milestone 1.6 features
+
+- New modular player runtime:
+  - `app/static/player/runtime.js`
+  - `app/static/player/tooltip.js`
+  - `app/static/player/events.js`
+- Responsive frame-holder sizing that keeps demo content centered and aspect-ratio safe.
+- Screen rendering parity for:
+  - `image`
+  - `video` (supports `timeSec` + optional `autoPlay`)
+  - `html` (iframe with transform scaling + guided/sandbox pointer mode flag)
+- Accessible hotspot button overlay with pulse/highlight/none variants and ARIA attributes.
+- Portal tooltip with viewport-aware placement (`auto|top|right|bottom|left`), arrow pointer, markdown-safe body rendering, and Back/Next buttons.
+- Bottom toolbar with scrim, `Prev`, `Next`, `Open In New Tab`, `Fullscreen`, and progress.
+- Client event hooks emitted as window `CustomEvent`s:
+  - `supaclone:demo_view`
+  - `supaclone:demo_start`
+  - `supaclone:step_view`
+  - `supaclone:step_complete`
+  - `supaclone:hotspot_click`
+  - `supaclone:demo_complete`
+- Session id generation and persistence for player events (cookie + localStorage fallback).
+- Optional badge slot via demo config (`demo.ui.badge`).
+
+## Milestone 2 features
+
+- `GET /embed.js` script endpoint for iframe mounting.
+- Embed slug resolution support:
+  - `data-demo-slug` on `<script>`
+  - `?slug=<demo-slug>` query param
+- Embed event bridge (window custom events):
+  - `supaclone:start`
+  - `supaclone:step`
+  - `supaclone:complete`
+- Showcases:
+  - `GET /showcase/{slug}` (landing page with search/tag filters)
+  - `GET /api/showcases/{slug}` (JSON feed for filtered demos)
+- Demo metadata support for collections:
+  - `demo.tags` field in schema.
+- Builder intro configuration:
+  - intro enabled toggle
+  - intro title/body
+  - start and skip button labels
+
+Embed example:
+
+```html
+<script src="http://127.0.0.1:8000/embed.js?slug=your-demo-slug"></script>
+```
+
+## Milestone 3 features
+
+- Analytics event ingest endpoint:
+  - `POST /api/analytics/events`
+- Analytics summary endpoint:
+  - `GET /api/analytics/{slug}/summary`
+- Analytics CSV export endpoint:
+  - `GET /api/analytics/{slug}/events.csv`
+- Analytics dashboard page:
+  - `GET /analytics/{slug}`
+- Session tracking:
+  - cookie key `supaclone_session_id`
+  - player emits and posts analytics events to backend automatically.
+- End-of-demo feedback capture:
+  - automatic feedback modal appears when the user completes a demo
+  - captures 1-5 score + optional text comment
+  - stores feedback in analytics events (`supaclone:feedback_submit`)
+  - surfaces response count, average score, and latest comments in `/analytics/{slug}`
+
+## Admin Dashboard
+
+- Route: `GET /admin`
+- Password protected login form (default password: `kaplanlife`)
+- Includes:
+  - quick links to core app paths
+  - list of all demos
+  - direct links to each demo, analytics, and API JSON
+  - delete action for removing demos (also removes related analytics rows)
+
+## Brand Compliance Checklist
+
+- Fonts loaded: Open Sans (default UI), Merriweather (editorial headings), Noto Sans fallback.
+- Token-only colour system implemented in `app/static/brand.css`.
+- Templates load `brand.css` before `app.css`.
+- Builder top bar includes Kaplan International Pathways logo with clearspace.
+- Primary/secondary/ghost button hierarchy mapped to KP colour tokens.
+- Visible focus ring and contrast-safe text/control palette for key interactions.

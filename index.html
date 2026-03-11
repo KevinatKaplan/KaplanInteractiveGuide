@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import math
+import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,80}$")
+
+
+class Hotspot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    xPct: float = Field(ge=0, le=1)
+    yPct: float = Field(ge=0, le=1)
+    wPct: float = Field(gt=0, le=1)
+    hPct: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def bounds_check(self) -> Hotspot:
+        if self.xPct + self.wPct > 1:
+            raise ValueError("hotspot xPct + wPct must be <= 1")
+        if self.yPct + self.hPct > 1:
+            raise ValueError("hotspot yPct + hPct must be <= 1")
+        return self
+
+
+class Screen(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    mediaType: Literal["image", "video", "html"] = "image"
+    mediaUrl: str
+    imageUrl: str | None = None
+    naturalWidth: int | None = None
+    naturalHeight: int | None = None
+    duration: float | None = None
+    markers: list[float] = Field(default_factory=list, max_length=300)
+    fitMode: Literal["contain", "cover"] = "contain"
+    interactionMode: Literal["guided", "sandbox"] = "guided"
+    order: int
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        if not ID_PATTERN.match(value):
+            raise ValueError("id must be alphanumeric and may include - or _")
+        return value
+
+    @model_validator(mode="after")
+    def normalize_markers(self) -> Screen:
+        normalized: list[float] = []
+        seen: set[float] = set()
+        max_value = self.duration if isinstance(self.duration, (int, float)) and self.duration > 0 else None
+        for raw in self.markers:
+            value = float(raw)
+            if not math.isfinite(value) or value < 0:
+                continue
+            if max_value is not None:
+                value = min(value, max_value)
+            rounded = round(value, 2)
+            if rounded in seen:
+                continue
+            seen.add(rounded)
+            normalized.append(rounded)
+        normalized.sort()
+        self.markers = normalized
+        return self
+
+
+class Chapter(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    order: int
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        if not ID_PATTERN.match(value):
+            raise ValueError("id must be alphanumeric and may include - or _")
+        return value
+
+
+class Step(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    screenId: str | None
+    title: str
+    body: str = ""
+    hotspot: Hotspot | None = None
+    hotspotType: Literal["click", "highlight", "none"] = "click"
+    hotspotId: str | None = None
+    hintType: Literal["click", "arrow", "none"] = "click"
+    tooltipPosition: Literal["auto", "top", "right", "bottom", "left"] = "auto"
+    timeSec: float | None = None
+    autoPlay: bool = False
+    advanceOnTooltipClick: bool = False
+    nextStepId: str | None = None
+    chapterId: str | None = None
+    order: int
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        if not ID_PATTERN.match(value):
+            raise ValueError("id must be alphanumeric and may include - or _")
+        return value
+
+
+class BadgeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    label: str = "Guided demo"
+    icon: str = ""
+    href: str = ""
+
+
+class IntroConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    title: str = ""
+    body: str = ""
+    startLabel: str = "Start Interactive Demo"
+    skipLabel: str = "Skip Intro"
+
+
+class DemoUI(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    badge: BadgeConfig = Field(default_factory=BadgeConfig)
+    intro: IntroConfig = Field(default_factory=IntroConfig)
+
+
+class Demo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    slug: str
+    title: str
+    schemaVersion: int = 1
+    status: Literal["draft", "published"] = "draft"
+    tags: list[str] = Field(default_factory=list)
+    startStepId: str | None = None
+    screens: list[Screen] = Field(default_factory=list)
+    steps: list[Step] = Field(default_factory=list)
+    chapters: list[Chapter] = Field(default_factory=list)
+    ui: DemoUI = Field(default_factory=DemoUI)
+    createdAt: str
+    updatedAt: str
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        if not ID_PATTERN.match(value):
+            raise ValueError("id must be alphanumeric and may include - or _")
+        return value
+
+    @model_validator(mode="after")
+    def reference_checks(self) -> Demo:
+        screen_ids = {screen.id for screen in self.screens}
+        step_ids = {step.id for step in self.steps}
+        chapter_ids = {chapter.id for chapter in self.chapters}
+        screen_orders = [screen.order for screen in self.screens]
+        step_orders = [step.order for step in self.steps]
+        chapter_orders = [chapter.order for chapter in self.chapters]
+
+        if len(screen_ids) != len(self.screens):
+            raise ValueError("screen ids must be unique")
+        if len(step_ids) != len(self.steps):
+            raise ValueError("step ids must be unique")
+        if len(chapter_ids) != len(self.chapters):
+            raise ValueError("chapter ids must be unique")
+        if len(set(screen_orders)) != len(screen_orders):
+            raise ValueError("screen order values must be unique")
+        if len(set(step_orders)) != len(step_orders):
+            raise ValueError("step order values must be unique")
+        if len(set(chapter_orders)) != len(chapter_orders):
+            raise ValueError("chapter order values must be unique")
+
+        if self.startStepId and self.startStepId not in step_ids:
+            raise ValueError("startStepId must reference an existing step")
+
+        for step in self.steps:
+            if step.screenId and step.screenId not in screen_ids:
+                raise ValueError(f"step {step.id} references missing screenId")
+            if step.nextStepId and step.nextStepId not in step_ids:
+                raise ValueError(f"step {step.id} references missing nextStepId")
+            if step.chapterId and step.chapterId not in chapter_ids:
+                raise ValueError(f"step {step.id} references missing chapterId")
+
+        return self
+
+
+class AnalyticsEventIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    eventName: Literal[
+        "supaclone:demo_view",
+        "supaclone:demo_start",
+        "supaclone:step_view",
+        "supaclone:step_complete",
+        "supaclone:hotspot_click",
+        "supaclone:demo_complete",
+        "supaclone:feedback_submit",
+    ]
+    demoId: str
+    slug: str
+    sessionId: str | None = None
+    stepId: str | None = None
+    index: int | None = None
+    hotspotId: str | None = None
+    ts: str | None = None
+    feedbackScore: int | None = Field(default=None, ge=1, le=5)
+    feedbackText: str | None = Field(default=None, max_length=1200)
+
+    @model_validator(mode="after")
+    def validate_feedback(self) -> AnalyticsEventIn:
+        if self.eventName == "supaclone:feedback_submit" and self.feedbackScore is None:
+            raise ValueError("feedbackScore is required for feedback submit events")
+        return self
+
+
+class AutoBuildFrame(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    timeSec: float = Field(ge=0)
+    imageBase64: str = Field(min_length=100)
+
+
+class AutoBuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    screenId: str
+    overwrite: bool = True
+    frames: list[AutoBuildFrame] = Field(min_length=3, max_length=10)
+
+
+class AutoBuildDraftChapter(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=80)
+
+
+class AutoBuildDraftStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=120)
+    body: str = Field(default="", max_length=500)
+    timeSec: float = Field(default=0, ge=0)
+    chapterTitle: str = Field(default="Overview", min_length=1, max_length=80)
+    hintType: Literal["click", "arrow", "none"] = "click"
+    tooltipPosition: Literal["auto", "top", "right", "bottom", "left"] = "auto"
+    hotspot: Hotspot | None = None
+
+
+class AutoBuildDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    screenId: str
+    overwrite: bool = True
+    chapters: list[AutoBuildDraftChapter] = Field(default_factory=list)
+    steps: list[AutoBuildDraftStep] = Field(min_length=1, max_length=50)

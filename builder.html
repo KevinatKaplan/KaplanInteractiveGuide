@@ -1,0 +1,1442 @@
+from __future__ import annotations
+
+import base64
+import csv
+import hashlib
+import json
+import os
+import re
+import uuid
+from collections import Counter
+from contextlib import asynccontextmanager
+from io import StringIO
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+import httpx
+from pydantic import ValidationError
+
+from . import db as db_ops
+from .db import now_iso
+from .models import AnalyticsEventIn, AutoBuildDraftRequest, AutoBuildRequest, Demo
+from .storage import DemoStore, LocalMediaStore, MediaStore, SqliteDemoStore
+
+APP_DIR = Path(__file__).resolve().parent
+BASE_DIR = APP_DIR.parent
+templates = Jinja2Templates(directory=APP_DIR / "templates")
+templates.env.globals["asset_v"] = os.getenv("ASSET_VERSION", "20260310-11")
+
+
+def _int_env(name: str, default_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default_value
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be > 0")
+    return parsed
+
+
+def create_demo_store() -> DemoStore:
+    mode = os.getenv("STORAGE_MODE", "local").lower()
+    if mode != "local":
+        raise RuntimeError(f"Unsupported STORAGE_MODE '{mode}'. Only 'local' is implemented.")
+    db_path = Path(os.getenv("DEMO_DB_PATH", str(BASE_DIR / "data" / "app.db")))
+    return SqliteDemoStore(db_path=db_path)
+
+
+def create_media_store() -> MediaStore:
+    mode = os.getenv("STORAGE_MODE", "local").lower()
+    if mode != "local":
+        raise RuntimeError(f"Unsupported STORAGE_MODE '{mode}'. Only 'local' is implemented.")
+    upload_dir = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploads")))
+    max_upload_bytes = _int_env("MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
+    return LocalMediaStore(
+        upload_dir=upload_dir,
+        max_upload_bytes=max_upload_bytes,
+    )
+
+
+def cors_origins() -> list[str]:
+    raw = os.getenv(
+        "CORS_ALLOW_ORIGINS",
+        ",".join(
+            [
+                "http://localhost",
+                "http://127.0.0.1",
+                "http://localhost:8000",
+                "http://127.0.0.1:8000",
+            ]
+        ),
+    )
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+demo_store = create_demo_store()
+media_store = create_media_store()
+analytics_db_path = Path(os.getenv("DEMO_DB_PATH", str(BASE_DIR / "data" / "app.db")))
+session_cookie_name = "supaclone_session_id"
+STEP_EVENT_NAMES = {
+    "supaclone:step_view",
+    "supaclone:step_complete",
+    "supaclone:hotspot_click",
+}
+admin_cookie_name = os.getenv("ADMIN_COOKIE_NAME", "ig_admin_session")
+admin_password_value = os.getenv("ADMIN_PASSWORD", "kaplanlife")
+admin_secret = os.getenv("ADMIN_SECRET", "interactive-guide-local")
+
+
+def ensure_platform_sample_demo() -> None:
+    existing = demo_store.get_by_slug("platform-sample")
+    timestamp = now_iso()
+    demo_id = existing.id if existing else f"demo-{uuid.uuid4().hex[:12]}"
+    created_at = existing.createdAt if existing else timestamp
+    sample_video_path = BASE_DIR / "uploads" / "platform-walkthrough-preview.mp4"
+    has_sample_video = sample_video_path.exists()
+    sample_video_url = "/uploads/platform-walkthrough-preview.mp4"
+    video_width = 1920
+    video_height = 1080
+    step_times = {
+        "step-01": 2.0,
+        "step-02": 8.0,
+        "step-03": 14.0,
+        "step-04": 20.0,
+        "step-05": 27.0,
+        "step-06": 35.0,
+        "step-07": 44.0,
+        "step-08": 52.0,
+    }
+    sample = Demo(
+        id=demo_id,
+        slug="platform-sample",
+        title="Interactive Guide Platform Walkthrough",
+        status="published",
+        tags=["sample", "onboarding", "platform"],
+        startStepId="step-01",
+        screens=[
+            {
+                "id": "screen-home",
+                "mediaType": "video" if has_sample_video else "html",
+                "mediaUrl": sample_video_url if has_sample_video else "/",
+                "imageUrl": None,
+                "naturalWidth": video_width if has_sample_video else 1366,
+                "naturalHeight": video_height if has_sample_video else 768,
+                "duration": None,
+                "markers": [],
+                "fitMode": "contain",
+                "interactionMode": "guided",
+                "order": 0,
+            },
+            {
+                "id": "screen-builder",
+                "mediaType": "video" if has_sample_video else "html",
+                "mediaUrl": sample_video_url if has_sample_video else "/builder",
+                "imageUrl": None,
+                "naturalWidth": video_width if has_sample_video else 1366,
+                "naturalHeight": video_height if has_sample_video else 768,
+                "duration": None,
+                "markers": [],
+                "fitMode": "contain",
+                "interactionMode": "guided",
+                "order": 1,
+            },
+            {
+                "id": "screen-showcase",
+                "mediaType": "video" if has_sample_video else "html",
+                "mediaUrl": sample_video_url if has_sample_video else "/showcase/all",
+                "imageUrl": None,
+                "naturalWidth": video_width if has_sample_video else 1366,
+                "naturalHeight": video_height if has_sample_video else 768,
+                "duration": None,
+                "markers": [],
+                "fitMode": "contain",
+                "interactionMode": "guided",
+                "order": 2,
+            },
+            {
+                "id": "screen-analytics",
+                "mediaType": "video" if has_sample_video else "html",
+                "mediaUrl": sample_video_url if has_sample_video else "/analytics/platform-sample",
+                "imageUrl": None,
+                "naturalWidth": video_width if has_sample_video else 1366,
+                "naturalHeight": video_height if has_sample_video else 768,
+                "duration": None,
+                "markers": [],
+                "fitMode": "contain",
+                "interactionMode": "guided",
+                "order": 3,
+            },
+            {
+                "id": "screen-admin",
+                "mediaType": "video" if has_sample_video else "html",
+                "mediaUrl": sample_video_url if has_sample_video else "/admin",
+                "imageUrl": None,
+                "naturalWidth": video_width if has_sample_video else 1366,
+                "naturalHeight": video_height if has_sample_video else 768,
+                "duration": None,
+                "markers": [],
+                "fitMode": "contain",
+                "interactionMode": "guided",
+                "order": 4,
+            },
+        ],
+        chapters=[
+            {"id": "chapter-01", "title": "Explore", "order": 0},
+            {"id": "chapter-02", "title": "Build", "order": 1},
+            {"id": "chapter-03", "title": "Share", "order": 2},
+            {"id": "chapter-04", "title": "Operate", "order": 3},
+        ],
+        steps=[
+            {
+                "id": "step-01",
+                "screenId": "screen-home",
+                "title": "Welcome To The Platform",
+                "body": "This sample walkthrough shows how to create, share, and track interactive demos.",
+                "hotspot": {"xPct": 0.58, "yPct": 0.19, "wPct": 0.36, "hPct": 0.46},
+                "hotspotType": "highlight",
+                "hotspotId": "hotspot-01",
+                "hintType": "click",
+                "tooltipPosition": "left",
+                "timeSec": step_times["step-01"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": "step-02",
+                "chapterId": "chapter-01",
+                "order": 0,
+            },
+            {
+                "id": "step-02",
+                "screenId": "screen-home",
+                "title": "Open Builder",
+                "body": "Use the Builder action to start a new interactive guide.",
+                "hotspot": {"xPct": 0.77, "yPct": 0.065, "wPct": 0.085, "hPct": 0.065},
+                "hotspotType": "click",
+                "hotspotId": "hotspot-02",
+                "hintType": "arrow",
+                "tooltipPosition": "bottom",
+                "timeSec": step_times["step-02"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": "step-03",
+                "chapterId": "chapter-01",
+                "order": 1,
+            },
+            {
+                "id": "step-03",
+                "screenId": "screen-builder",
+                "title": "Configure Demo Metadata",
+                "body": "Set the demo title and review the generated slug in the top bar.",
+                "hotspot": {"xPct": 0.29, "yPct": 0.07, "wPct": 0.32, "hPct": 0.085},
+                "hotspotType": "highlight",
+                "hotspotId": "hotspot-03",
+                "hintType": "click",
+                "tooltipPosition": "bottom",
+                "timeSec": step_times["step-03"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": "step-04",
+                "chapterId": "chapter-02",
+                "order": 2,
+            },
+            {
+                "id": "step-04",
+                "screenId": "screen-builder",
+                "title": "Add Steps And Chapters",
+                "body": "Use the left panel to create structured steps and group them into chapters.",
+                "hotspot": {"xPct": 0.03, "yPct": 0.19, "wPct": 0.25, "hPct": 0.68},
+                "hotspotType": "highlight",
+                "hotspotId": "hotspot-04",
+                "hintType": "arrow",
+                "tooltipPosition": "right",
+                "timeSec": step_times["step-04"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": "step-05",
+                "chapterId": "chapter-02",
+                "order": 3,
+            },
+            {
+                "id": "step-05",
+                "screenId": "screen-builder",
+                "title": "Publish Your Demo",
+                "body": "Publish to generate a share link and iframe snippet.",
+                "hotspot": {"xPct": 0.89, "yPct": 0.07, "wPct": 0.095, "hPct": 0.07},
+                "hotspotType": "click",
+                "hotspotId": "hotspot-05",
+                "hintType": "click",
+                "tooltipPosition": "left",
+                "timeSec": step_times["step-05"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": "step-06",
+                "chapterId": "chapter-03",
+                "order": 4,
+            },
+            {
+                "id": "step-06",
+                "screenId": "screen-showcase",
+                "title": "Browse Showcase Demos",
+                "body": "Showcase helps teams discover demos by title and tags.",
+                "hotspot": {"xPct": 0.04, "yPct": 0.22, "wPct": 0.92, "hPct": 0.17},
+                "hotspotType": "highlight",
+                "hotspotId": "hotspot-06",
+                "hintType": "arrow",
+                "tooltipPosition": "bottom",
+                "timeSec": step_times["step-06"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": "step-07",
+                "chapterId": "chapter-03",
+                "order": 5,
+            },
+            {
+                "id": "step-07",
+                "screenId": "screen-analytics",
+                "title": "Monitor Completion And Feedback",
+                "body": "Analytics reports views, starts, completion rate, and end-of-demo feedback.",
+                "hotspot": {"xPct": 0.04, "yPct": 0.23, "wPct": 0.92, "hPct": 0.27},
+                "hotspotType": "highlight",
+                "hotspotId": "hotspot-07",
+                "hintType": "click",
+                "tooltipPosition": "bottom",
+                "timeSec": step_times["step-07"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": "step-08",
+                "chapterId": "chapter-04",
+                "order": 6,
+            },
+            {
+                "id": "step-08",
+                "screenId": "screen-admin",
+                "title": "Use Admin Dashboard",
+                "body": "Admins can manage all demos and jump directly back into builder edits.",
+                "hotspot": {"xPct": 0.05, "yPct": 0.31, "wPct": 0.9, "hPct": 0.56},
+                "hotspotType": "highlight",
+                "hotspotId": "hotspot-08",
+                "hintType": "arrow",
+                "tooltipPosition": "top",
+                "timeSec": step_times["step-08"] if has_sample_video else None,
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": None,
+                "chapterId": "chapter-04",
+                "order": 7,
+            },
+        ],
+        ui={
+            "badge": {"enabled": False, "label": "", "icon": "", "href": ""},
+            "intro": {
+                "enabled": True,
+                "title": "Interactive Guide Platform Walkthrough",
+                "body": "Learn the full workflow to build, publish, and manage product demos in minutes.",
+                "startLabel": "Start Platform Tour",
+                "skipLabel": "Skip Intro",
+            },
+        },
+        createdAt=created_at,
+        updatedAt=timestamp,
+    )
+    if existing:
+        demo_store.update(sample)
+    else:
+        demo_store.create(sample)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    demo_store.init()
+    media_store.init()
+    ensure_platform_sample_demo()
+    yield
+
+app = FastAPI(title="Interactive Guide MVP", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
+media_store.mount(app)
+
+
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "demo"
+
+
+def unique_slug(title: str) -> str:
+    base = slugify(title)
+    candidate = base
+    counter = 1
+    while demo_store.slug_exists(candidate):
+        counter += 1
+        candidate = f"{base}-{counter}"
+    return candidate
+
+
+def normalize_ordered_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(items, key=lambda item: item.get("order", 0))
+    for index, item in enumerate(ordered):
+        item["order"] = index
+    return ordered
+
+
+def migrate_demo_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(payload)
+    migrated["schemaVersion"] = int(migrated.get("schemaVersion") or 1)
+    migrated["status"] = migrated.get("status") or "draft"
+    migrated["tags"] = [str(tag).strip() for tag in (migrated.get("tags") or []) if str(tag).strip()]
+    migrated["chapters"] = list(migrated.get("chapters") or [])
+    migrated["screens"] = list(migrated.get("screens") or [])
+    migrated["steps"] = list(migrated.get("steps") or [])
+    migrated["ui"] = dict(migrated.get("ui") or {})
+    migrated["ui"]["badge"] = dict(migrated["ui"].get("badge") or {})
+    migrated["ui"]["intro"] = dict(migrated["ui"].get("intro") or {})
+    migrated["ui"]["intro"]["enabled"] = bool(migrated["ui"]["intro"].get("enabled", True))
+    migrated["ui"]["intro"]["title"] = str(migrated["ui"]["intro"].get("title") or "")
+    migrated["ui"]["intro"]["body"] = str(migrated["ui"]["intro"].get("body") or "")
+    migrated["ui"]["intro"]["startLabel"] = str(
+        migrated["ui"]["intro"].get("startLabel") or "Start Interactive Demo"
+    )
+    migrated["ui"]["intro"]["skipLabel"] = str(migrated["ui"]["intro"].get("skipLabel") or "Skip Intro")
+
+    for chapter in migrated["chapters"]:
+        chapter["id"] = chapter.get("id") or f"chapter-{uuid.uuid4().hex[:8]}"
+        chapter["title"] = chapter.get("title") or "Chapter"
+        chapter["order"] = int(chapter.get("order", 0))
+
+    for screen in migrated["screens"]:
+        screen["id"] = screen.get("id") or f"screen-{uuid.uuid4().hex[:8]}"
+        screen["mediaType"] = screen.get("mediaType") or "image"
+        media_url = screen.get("mediaUrl") or screen.get("imageUrl")
+        screen["mediaUrl"] = media_url
+        screen["imageUrl"] = screen.get("imageUrl") or media_url
+        marker_values: list[float] = []
+        for value in (screen.get("markers") or []):
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            marker_values.append(parsed)
+        screen["markers"] = marker_values
+        screen["fitMode"] = screen.get("fitMode") or "contain"
+        screen["interactionMode"] = screen.get("interactionMode") or "guided"
+        screen["order"] = int(screen.get("order", 0))
+
+    for step in migrated["steps"]:
+        step["id"] = step.get("id") or f"step-{uuid.uuid4().hex[:8]}"
+        step["title"] = step.get("title") or "Step"
+        step["body"] = step.get("body") or ""
+        step["hintType"] = step.get("hintType") or "click"
+        step["hotspotType"] = step.get("hotspotType") or "click"
+        step["hotspotId"] = step.get("hotspotId")
+        step["tooltipPosition"] = step.get("tooltipPosition") or "auto"
+        step["chapterId"] = step.get("chapterId")
+        step["screenId"] = step.get("screenId")
+        step["nextStepId"] = step.get("nextStepId")
+        step["autoPlay"] = bool(step.get("autoPlay", False))
+        step["advanceOnTooltipClick"] = bool(step.get("advanceOnTooltipClick", False))
+        step["order"] = int(step.get("order", 0))
+        hotspot = step.get("hotspot")
+        if hotspot:
+            for key in ("xPct", "yPct", "wPct", "hPct"):
+                value = hotspot.get(key, 0)
+                if value > 1:
+                    hotspot[key] = value / 100.0
+            step["hotspot"] = hotspot
+
+    migrated["chapters"] = normalize_ordered_items(migrated["chapters"])
+    migrated["screens"] = normalize_ordered_items(migrated["screens"])
+    migrated["steps"] = normalize_ordered_items(migrated["steps"])
+    return migrated
+
+
+def build_validation_error(exc: ValidationError) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for issue in exc.errors():
+        loc = ".".join(str(part) for part in issue.get("loc", []))
+        msg = issue.get("msg", "Invalid value")
+        messages.append({"field": loc, "msg": msg})
+    return messages
+
+
+def _showcase_cards(slug: str, q: str | None, tag: str | None) -> tuple[list[dict[str, Any]], list[str]]:
+    demos = demo_store.list_demos()
+    showcase_slug = slug.strip().lower()
+    query = (q or "").strip().lower()
+    tag_filter = (tag or "").strip().lower()
+
+    filtered = demos
+    if showcase_slug and showcase_slug != "all":
+        filtered = [demo for demo in filtered if showcase_slug in {value.lower() for value in demo.tags}]
+
+    if query:
+        filtered = [
+            demo
+            for demo in filtered
+            if query in demo.title.lower()
+            or query in demo.slug.lower()
+            or any(query in tag_value.lower() for tag_value in demo.tags)
+        ]
+
+    if tag_filter:
+        filtered = [demo for demo in filtered if tag_filter in {value.lower() for value in demo.tags}]
+
+    cards = [
+        {
+            "id": demo.id,
+            "slug": demo.slug,
+            "title": demo.title,
+            "status": demo.status,
+            "updatedAt": demo.updatedAt,
+            "tags": demo.tags,
+            "stepCount": len(demo.steps),
+        }
+        for demo in filtered
+    ]
+
+    tags = sorted({tag_value for demo in demos for tag_value in demo.tags})
+    return cards, tags
+
+
+def _sessions_for(
+    events: list[dict[str, Any]],
+    event_name: str,
+    step_id: str | None = None,
+) -> set[str]:
+    return {
+        event["session_id"]
+        for event in events
+        if event.get("event_name") == event_name and (step_id is None or event.get("step_id") == step_id)
+    }
+
+
+def _parse_event_meta(event: dict[str, Any]) -> dict[str, Any]:
+    raw = event.get("event_meta")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _analytics_summary(demo: Demo) -> dict[str, Any]:
+    events = db_ops.fetch_analytics_events_for_demo(demo.id, analytics_db_path)
+    event_totals = Counter(event["event_name"] for event in events)
+
+    view_sessions = _sessions_for(events, "supaclone:demo_view")
+    start_sessions = _sessions_for(events, "supaclone:demo_start")
+    complete_sessions = _sessions_for(events, "supaclone:demo_complete")
+
+    steps_ordered = sorted(demo.steps, key=lambda item: item.order)
+    step_rows: list[dict[str, Any]] = []
+    start_count = len(start_sessions)
+
+    for index, step in enumerate(steps_ordered):
+        reached_sessions = _sessions_for(events, "supaclone:step_view", step.id)
+        complete_step_sessions = _sessions_for(events, "supaclone:step_complete", step.id)
+        reached_count = len(reached_sessions)
+        complete_count = len(complete_step_sessions)
+
+        if index < len(steps_ordered) - 1:
+            next_reached = len(_sessions_for(events, "supaclone:step_view", steps_ordered[index + 1].id))
+            dropoff = max(reached_count - next_reached, 0)
+        else:
+            dropoff = max(reached_count - len(complete_sessions), 0)
+
+        step_rows.append(
+            {
+                "stepId": step.id,
+                "title": step.title,
+                "index": index,
+                "reached": reached_count,
+                "completed": complete_count,
+                "dropoff": dropoff,
+                "reachRate": round((reached_count / start_count) * 100, 2) if start_count else 0.0,
+            }
+        )
+
+    starts = len(start_sessions)
+    completes = len(complete_sessions)
+    completion_rate = round((completes / starts) * 100, 2) if starts else 0.0
+    feedback_events = [event for event in events if event.get("event_name") == "supaclone:feedback_submit"]
+    feedback_scores: list[int] = []
+    feedback_comments: list[dict[str, Any]] = []
+    for event in feedback_events:
+        meta = _parse_event_meta(event)
+        score = meta.get("feedbackScore")
+        if isinstance(score, int):
+            feedback_scores.append(score)
+        text = str(meta.get("feedbackText") or "").strip()
+        if text:
+            feedback_comments.append(
+                {
+                    "sessionId": event.get("session_id"),
+                    "score": score if isinstance(score, int) else None,
+                    "text": text,
+                    "createdAt": event.get("created_at"),
+                }
+            )
+
+    feedback_average = round(sum(feedback_scores) / len(feedback_scores), 2) if feedback_scores else None
+
+    return {
+        "demoId": demo.id,
+        "slug": demo.slug,
+        "title": demo.title,
+        "views": len(view_sessions),
+        "starts": starts,
+        "completes": completes,
+        "completionRate": completion_rate,
+        "eventTotals": dict(event_totals),
+        "stepDropoff": step_rows,
+        "feedbackCount": len(feedback_events),
+        "feedbackAverageScore": feedback_average,
+        "feedbackComments": feedback_comments[:20],
+    }
+
+
+def _admin_cookie_value() -> str:
+    digest = hashlib.sha256(f"{admin_password_value}:{admin_secret}".encode("utf-8")).hexdigest()
+    return digest
+
+
+def _is_admin_request(request: Request) -> bool:
+    provided = request.cookies.get(admin_cookie_name, "")
+    return provided == _admin_cookie_value()
+
+
+def _admin_paths() -> list[dict[str, str]]:
+    return [
+        {"label": "Landing", "path": "/"},
+        {"label": "Builder", "path": "/builder"},
+        {"label": "Showcase", "path": "/showcase/all"},
+        {"label": "Sample Demo", "path": "/demo/platform-sample"},
+        {"label": "Admin", "path": "/admin"},
+        {"label": "Embed Script", "path": "/embed.js?slug=platform-sample"},
+    ]
+
+
+def _normalize_hotspot(candidate: dict[str, Any] | None) -> dict[str, float]:
+    default = {"xPct": 0.38, "yPct": 0.42, "wPct": 0.22, "hPct": 0.14}
+    if not isinstance(candidate, dict):
+        return default
+
+    try:
+        x = float(candidate.get("xPct", default["xPct"]))
+        y = float(candidate.get("yPct", default["yPct"]))
+        w = float(candidate.get("wPct", default["wPct"]))
+        h = float(candidate.get("hPct", default["hPct"]))
+    except (TypeError, ValueError):
+        return default
+
+    x = min(max(x, 0.0), 0.95)
+    y = min(max(y, 0.0), 0.95)
+    w = min(max(w, 0.03), 1.0 - x)
+    h = min(max(h, 0.03), 1.0 - y)
+    return {"xPct": round(x, 4), "yPct": round(y, 4), "wPct": round(w, 4), "hPct": round(h, 4)}
+
+
+def _fallback_hotspot(index: int) -> dict[str, float]:
+    patterns = [
+        {"xPct": 0.12, "yPct": 0.12, "wPct": 0.24, "hPct": 0.13},
+        {"xPct": 0.58, "yPct": 0.15, "wPct": 0.28, "hPct": 0.14},
+        {"xPct": 0.18, "yPct": 0.42, "wPct": 0.26, "hPct": 0.16},
+        {"xPct": 0.56, "yPct": 0.46, "wPct": 0.3, "hPct": 0.16},
+        {"xPct": 0.24, "yPct": 0.72, "wPct": 0.26, "hPct": 0.14},
+        {"xPct": 0.62, "yPct": 0.72, "wPct": 0.24, "hPct": 0.14},
+    ]
+    return patterns[index % len(patterns)]
+
+
+def _fallback_auto_build(frames: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    times = sorted({round(float(item["timeSec"]), 2) for item in frames})
+    selected = [times[index] for index in range(0, len(times), max(len(times) // 6, 1))][:7]
+    if not selected:
+        selected = [0.0]
+
+    chapter_titles = ["Orientation", "Primary Action", "Validation"]
+    steps: list[dict[str, Any]] = []
+    for index, time_sec in enumerate(selected):
+        chapter_title = chapter_titles[min(index * len(chapter_titles) // max(len(selected), 1), len(chapter_titles) - 1)]
+        hotspot = _fallback_hotspot(index)
+        steps.append(
+            {
+                "title": f"Draft Step {index + 1}",
+                "body": (
+                    f"Draft generated from frame at {time_sec:.2f}s. "
+                    "Adjust this instruction and hotspot to match the exact UI action."
+                ),
+                "timeSec": time_sec,
+                "hotspot": hotspot,
+                "hintType": "click" if index % 2 == 0 else "arrow",
+                "tooltipPosition": "auto",
+                "chapterTitle": chapter_title,
+            }
+        )
+
+    chapters = [{"title": title} for title in chapter_titles if any(step["chapterTitle"] == title for step in steps)]
+    return chapters, steps
+
+
+def _parse_ai_json(content: str) -> dict[str, Any]:
+    raw = content.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    return json.loads(raw)
+
+
+async def _openai_auto_build(
+    demo: Demo,
+    frames: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set for Auto Build")
+
+    model = os.getenv("AUTOBUILD_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    user_content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "Build a concise interactive product tutorial from these video frames.\n"
+                "Return strict JSON only with shape:\n"
+                "{\n"
+                "  \"chapters\": [{\"title\":\"...\"}],\n"
+                "  \"steps\": [{\n"
+                "    \"title\":\"...\",\n"
+                "    \"body\":\"...\",\n"
+                "    \"timeSec\": 12.3,\n"
+                "    \"chapterTitle\":\"...\",\n"
+                "    \"hintType\":\"click|arrow|none\",\n"
+                "    \"tooltipPosition\":\"auto|top|right|bottom|left\",\n"
+                "    \"hotspot\": {\"xPct\":0-1,\"yPct\":0-1,\"wPct\":0-1,\"hPct\":0-1}\n"
+                "  }]\n"
+                "}\n"
+                "Rules:\n"
+                "- Use concrete UI language from what is visible in the frames.\n"
+                "- Do not use generic text such as 'Auto-generated draft step'.\n"
+                "- Vary hotspots by target element; do not reuse the exact same hotspot for every step.\n"
+                "- Keep titles action-oriented and unique.\n"
+                f"Demo title: {demo.title}\n"
+                "Generate 5-8 steps max."
+            ),
+        }
+    ]
+
+    for frame in sorted(frames, key=lambda item: item["timeSec"]):
+        user_content.append({"type": "text", "text": f"Frame at {frame['timeSec']} seconds"})
+        user_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{frame['imageBase64']}"},
+            }
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a product demo designer. Return valid JSON only.",
+            },
+            {
+                "role": "user",
+                "content": user_content,
+            },
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+        "max_tokens": 1400,
+    }
+
+    timeout = httpx.Timeout(45.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    message = data.get("choices", [{}])[0].get("message", {})
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "\n".join(
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict)
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("AI response content was empty")
+    parsed = _parse_ai_json(content)
+    chapters = parsed.get("chapters") if isinstance(parsed.get("chapters"), list) else []
+    steps = parsed.get("steps") if isinstance(parsed.get("steps"), list) else []
+    if not steps:
+        raise RuntimeError("AI did not return any steps")
+    return chapters, steps
+
+
+def _build_steps_from_draft(
+    draft_steps: list[dict[str, Any]],
+    screen_id: str,
+    duration: float | None,
+    start_order: int = 0,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    max_time = max(duration or 0.0, 0.0)
+    prepared: list[dict[str, Any]] = []
+    chapter_map: dict[str, str] = {}
+
+    for index, raw in enumerate(draft_steps):
+        title = str(raw.get("title") or f"Step {index + 1}").strip()[:120]
+        body = str(raw.get("body") or "").strip()[:500]
+        chapter_title = str(raw.get("chapterTitle") or "Overview").strip()[:80] or "Overview"
+        chapter_id = chapter_map.get(chapter_title)
+        if not chapter_id:
+            chapter_id = f"chapter-{uuid.uuid4().hex[:8]}"
+            chapter_map[chapter_title] = chapter_id
+
+        try:
+            time_sec = float(raw.get("timeSec", 0))
+        except (TypeError, ValueError):
+            time_sec = 0.0
+        time_sec = max(0.0, time_sec)
+        if max_time > 0:
+            time_sec = min(time_sec, max_time)
+
+        hint_type = str(raw.get("hintType") or "click")
+        if hint_type not in {"click", "arrow", "none"}:
+            hint_type = "click"
+
+        tooltip_position = str(raw.get("tooltipPosition") or "auto")
+        if tooltip_position not in {"auto", "top", "right", "bottom", "left"}:
+            tooltip_position = "auto"
+
+        step_id = f"step-{uuid.uuid4().hex[:8]}"
+        prepared.append(
+            {
+                "id": step_id,
+                "screenId": screen_id,
+                "title": title or f"Step {index + 1}",
+                "body": body,
+                "hotspot": _normalize_hotspot(raw.get("hotspot")),
+                "hotspotType": "highlight",
+                "hotspotId": f"hotspot-{uuid.uuid4().hex[:8]}",
+                "hintType": hint_type,
+                "tooltipPosition": tooltip_position,
+                "timeSec": round(time_sec, 2),
+                "autoPlay": False,
+                "advanceOnTooltipClick": False,
+                "nextStepId": None,
+                "chapterId": chapter_id,
+                "order": start_order + index,
+            }
+        )
+
+    for index in range(len(prepared) - 1):
+        prepared[index]["nextStepId"] = prepared[index + 1]["id"]
+    return prepared, chapter_map
+
+
+def _apply_auto_build_draft(
+    *,
+    demo: Demo,
+    screen_id: str,
+    duration: float | None,
+    overwrite: bool,
+    chapter_draft: list[dict[str, Any]],
+    step_draft: list[dict[str, Any]],
+) -> Demo:
+    payload = demo.model_dump()
+    existing_steps = list(payload.get("steps", []))
+    existing_chapters = list(payload.get("chapters", []))
+    start_order = 0 if overwrite else len(existing_steps)
+
+    generated_steps, chapter_map = _build_steps_from_draft(
+        draft_steps=step_draft,
+        screen_id=screen_id,
+        duration=duration,
+        start_order=start_order,
+    )
+
+    generated_chapters = [
+        {
+            "id": chapter_map[str(item.get("title") or "Overview").strip()[:80] or "Overview"],
+            "title": str(item.get("title") or "Overview").strip()[:80] or "Overview",
+            "order": index,
+        }
+        for index, item in enumerate(chapter_draft or [{"title": key} for key in chapter_map.keys()])
+        if (str(item.get("title") or "Overview").strip()[:80] or "Overview") in chapter_map
+    ]
+    if not generated_chapters:
+        generated_chapters = [
+            {"id": chapter_id, "title": title, "order": index}
+            for index, (title, chapter_id) in enumerate(chapter_map.items())
+        ]
+
+    if overwrite:
+        payload["steps"] = generated_steps
+        payload["chapters"] = generated_chapters
+        payload["startStepId"] = generated_steps[0]["id"]
+    else:
+        for chapter in existing_chapters:
+            chapter["order"] = int(chapter.get("order", 0))
+        offset = len(existing_chapters)
+        for index, chapter in enumerate(generated_chapters):
+            chapter["order"] = offset + index
+        payload["chapters"] = existing_chapters + generated_chapters
+        payload["steps"] = existing_steps + generated_steps
+        payload["startStepId"] = payload.get("startStepId") or generated_steps[0]["id"]
+
+    payload["updatedAt"] = now_iso()
+
+    return Demo.model_validate(migrate_demo_payload(payload))
+
+
+def _step_index_map(demo: Demo) -> dict[str, int]:
+    ordered_steps = sorted(demo.steps, key=lambda item: item.order)
+    return {step.id: index for index, step in enumerate(ordered_steps)}
+
+
+def _validate_analytics_event(demo: Demo, event: AnalyticsEventIn) -> tuple[str | None, int | None]:
+    step_id = event.stepId
+    step_index = event.index
+
+    if event.eventName in STEP_EVENT_NAMES:
+        if not step_id:
+            raise HTTPException(status_code=422, detail="stepId is required for step analytics events")
+        index_map = _step_index_map(demo)
+        if step_id not in index_map:
+            raise HTTPException(status_code=422, detail="stepId does not belong to this demo")
+        if step_index is None:
+            step_index = index_map[step_id]
+
+    return step_id, step_index
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/builder", response_class=HTMLResponse)
+def builder(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse("builder.html", {"request": request})
+
+
+@app.get("/demo/{slug}", response_class=HTMLResponse)
+def player(request: Request, slug: str) -> HTMLResponse:
+    return templates.TemplateResponse("player.html", {"request": request, "slug": slug})
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(request: Request) -> HTMLResponse:
+    is_admin = _is_admin_request(request)
+    demos = demo_store.list_demos() if is_admin else []
+    demo_rows = [
+        {
+            "id": demo.id,
+            "slug": demo.slug,
+            "title": demo.title,
+            "status": demo.status,
+            "updatedAt": demo.updatedAt,
+            "builderPath": f"/builder?demo={demo.slug}",
+            "demoPath": f"/demo/{demo.slug}",
+            "analyticsPath": f"/analytics/{demo.slug}",
+            "apiPath": f"/api/demos/{demo.slug}",
+        }
+        for demo in demos
+    ]
+    context = {
+        "request": request,
+        "is_admin": is_admin,
+        "paths": _admin_paths(),
+        "demos": demo_rows,
+        "error": "",
+    }
+    return templates.TemplateResponse("admin.html", context)
+
+
+@app.post("/admin/login")
+async def admin_login(request: Request, password: str = Form(default="")) -> Response:
+    if password != admin_password_value:
+        return templates.TemplateResponse(
+            "admin.html",
+            {
+                "request": request,
+                "is_admin": False,
+                "paths": _admin_paths(),
+                "demos": [],
+                "error": "Invalid password.",
+            },
+            status_code=401,
+        )
+
+    response = RedirectResponse(url="/admin", status_code=303)
+    response.set_cookie(
+        key=admin_cookie_name,
+        value=_admin_cookie_value(),
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 12,
+        path="/",
+    )
+    return response
+
+
+@app.post("/admin/logout")
+def admin_logout() -> RedirectResponse:
+    response = RedirectResponse(url="/admin", status_code=303)
+    response.delete_cookie(admin_cookie_name, path="/")
+    return response
+
+
+@app.post("/admin/demos/{demo_id}/delete")
+def admin_delete_demo(request: Request, demo_id: str) -> RedirectResponse:
+    if not _is_admin_request(request):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    deleted = demo_store.delete(demo_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Demo not found")
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.get("/analytics/{slug}", response_class=HTMLResponse)
+def analytics_page(request: Request, slug: str) -> HTMLResponse:
+    demo = demo_store.get_by_slug(slug)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+    summary = _analytics_summary(demo)
+    return templates.TemplateResponse(
+        "analytics.html",
+        {
+            "request": request,
+            "demo": demo,
+            "summary": summary,
+        },
+    )
+
+
+@app.get("/showcase/{slug}", response_class=HTMLResponse)
+def showcase(request: Request, slug: str, q: str | None = None, tag: str | None = None) -> HTMLResponse:
+    cards, tags = _showcase_cards(slug=slug, q=q, tag=tag)
+    context = {
+        "request": request,
+        "slug": slug,
+        "cards": cards,
+        "tags": tags,
+        "q": q or "",
+        "tag": tag or "",
+    }
+    return templates.TemplateResponse("showcase.html", context)
+
+
+@app.get("/api/showcases/{slug}")
+def showcase_data(slug: str, q: str | None = None, tag: str | None = None) -> JSONResponse:
+    cards, tags = _showcase_cards(slug=slug, q=q, tag=tag)
+    return JSONResponse({"slug": slug, "q": q or "", "tag": tag or "", "tags": tags, "demos": cards})
+
+
+@app.post("/api/analytics/events")
+async def track_analytics_event(request: Request) -> JSONResponse:
+    payload = await request.json()
+    try:
+        event = AnalyticsEventIn.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=build_validation_error(exc)) from exc
+
+    demo = demo_store.get_by_slug(event.slug)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+    if demo.id != event.demoId:
+        raise HTTPException(status_code=400, detail="Demo id and slug mismatch")
+    step_id, step_index = _validate_analytics_event(demo, event)
+    event_meta: dict[str, Any] = {}
+    if event.feedbackScore is not None:
+        event_meta["feedbackScore"] = event.feedbackScore
+    if event.feedbackText:
+        event_meta["feedbackText"] = event.feedbackText.strip()
+    event_meta_json = json.dumps(event_meta, separators=(",", ":")) if event_meta else None
+
+    session_id = (event.sessionId or "").strip() or request.cookies.get(session_cookie_name) or uuid.uuid4().hex
+    db_ops.insert_analytics_event(
+        {
+            "demo_id": demo.id,
+            "slug": demo.slug,
+            "session_id": session_id,
+            "event_name": event.eventName,
+            "step_id": step_id,
+            "step_index": step_index,
+            "hotspot_id": event.hotspotId,
+            "event_meta": event_meta_json,
+            "ts_client": event.ts,
+            "created_at": now_iso(),
+        },
+        analytics_db_path,
+    )
+
+    response = JSONResponse({"ok": True, "sessionId": session_id})
+    response.set_cookie(
+        key=session_cookie_name,
+        value=session_id,
+        httponly=False,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,
+        path="/",
+    )
+    return response
+
+
+@app.get("/api/analytics/{slug}/summary")
+def analytics_summary(slug: str) -> JSONResponse:
+    demo = demo_store.get_by_slug(slug)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+    return JSONResponse(_analytics_summary(demo))
+
+
+@app.get("/api/analytics/{slug}/events.csv")
+def analytics_csv(slug: str) -> Response:
+    demo = demo_store.get_by_slug(slug)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+
+    summary = _analytics_summary(demo)
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["metric", "value"])
+    writer.writerow(["demo_id", summary["demoId"]])
+    writer.writerow(["slug", summary["slug"]])
+    writer.writerow(["title", summary["title"]])
+    writer.writerow(["views", summary["views"]])
+    writer.writerow(["starts", summary["starts"]])
+    writer.writerow(["completes", summary["completes"]])
+    writer.writerow(["completion_rate_pct", summary["completionRate"]])
+    writer.writerow(["feedback_count", summary["feedbackCount"]])
+    writer.writerow(["feedback_avg_score", summary["feedbackAverageScore"] if summary["feedbackAverageScore"] is not None else ""])
+    writer.writerow([])
+    writer.writerow(["step_index", "step_id", "step_title", "reached", "completed", "dropoff", "reach_rate_pct"])
+    for row in summary["stepDropoff"]:
+        writer.writerow(
+            [
+                row["index"] + 1,
+                row["stepId"],
+                row["title"],
+                row["reached"],
+                row["completed"],
+                row["dropoff"],
+                row["reachRate"],
+            ]
+        )
+    if summary["feedbackComments"]:
+        writer.writerow([])
+        writer.writerow(["feedback_session_id", "feedback_score", "feedback_comment", "created_at"])
+        for item in summary["feedbackComments"]:
+            writer.writerow(
+                [
+                    item.get("sessionId", ""),
+                    item.get("score", ""),
+                    item.get("text", ""),
+                    item.get("createdAt", ""),
+                ]
+            )
+
+    filename = f"{demo.slug}-analytics.csv"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/embed.js")
+def embed_js(request: Request, slug: str | None = None) -> Response:
+    base_origin = str(request.base_url).rstrip("/")
+    default_slug = (slug or "").strip()
+    script = f"""
+(function() {{
+  var scriptTag = document.currentScript;
+  if (!scriptTag) {{
+    return;
+  }}
+
+  var sourceUrl = new URL(scriptTag.src, window.location.href);
+  var slugFromScript = scriptTag.getAttribute("data-demo-slug");
+  var slugFromQuery = sourceUrl.searchParams.get("slug");
+  var resolvedSlug = slugFromScript || slugFromQuery || "{default_slug}";
+  if (!resolvedSlug) {{
+    console.error("supaclone embed: missing demo slug");
+    return;
+  }}
+
+  var targetId = scriptTag.getAttribute("data-target-id");
+  var target = targetId ? document.getElementById(targetId) : null;
+  if (!target) {{
+    target = document.createElement("div");
+    scriptTag.insertAdjacentElement("afterend", target);
+  }}
+  target.classList.add("supaclone-embed-host");
+
+  var iframe = document.createElement("iframe");
+  iframe.src = "{base_origin}/demo/" + encodeURIComponent(resolvedSlug) + "?embed=1";
+  iframe.loading = "lazy";
+  iframe.style.width = "100%";
+  iframe.style.height = scriptTag.getAttribute("data-height") || "640px";
+  iframe.style.border = "0";
+  iframe.style.borderRadius = "12px";
+  iframe.style.overflow = "hidden";
+  iframe.allow = "fullscreen";
+  iframe.setAttribute("title", "Interactive demo");
+
+  target.innerHTML = "";
+  target.appendChild(iframe);
+
+  function forwardEvent(name, detail) {{
+    window.dispatchEvent(new CustomEvent(name, {{ detail: detail || {{}} }}));
+  }}
+
+  window.addEventListener("message", function(event) {{
+    if (!event.data || event.data.source !== "supaclone-player") {{
+      return;
+    }}
+    var payload = event.data.detail || {{}};
+    if (event.data.eventName === "supaclone:demo_start") {{
+      forwardEvent("supaclone:start", payload);
+    }} else if (event.data.eventName === "supaclone:step_view") {{
+      forwardEvent("supaclone:step", payload);
+    }} else if (event.data.eventName === "supaclone:demo_complete") {{
+      forwardEvent("supaclone:complete", payload);
+    }}
+    forwardEvent(event.data.eventName, payload);
+  }});
+}})();
+    """.strip()
+    return Response(content=script, media_type="application/javascript")
+
+
+@app.post("/api/demos")
+async def create_demo(request: Request) -> JSONResponse:
+    payload = await request.json()
+    title = payload.get("title") or "Untitled Demo"
+    demo_id = str(uuid.uuid4())
+    slug = unique_slug(title)
+    timestamp = now_iso()
+
+    demo = Demo(
+        id=demo_id,
+        slug=slug,
+        title=title,
+        status="draft",
+        tags=[],
+        startStepId=None,
+        screens=[],
+        steps=[],
+        chapters=[],
+        createdAt=timestamp,
+        updatedAt=timestamp,
+    )
+
+    demo_store.create(demo)
+    return JSONResponse(demo.model_dump())
+
+
+@app.put("/api/demos/{demo_id}")
+async def save_demo(request: Request, demo_id: str) -> JSONResponse:
+    existing = demo_store.get_by_id(demo_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Demo not found")
+
+    payload: dict[str, Any] = await request.json()
+    if payload.get("id") and payload.get("id") != demo_id:
+        raise HTTPException(status_code=400, detail="Demo id mismatch")
+    required_keys = ("title", "startStepId", "screens", "steps")
+    missing = [key for key in required_keys if key not in payload]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=[{"msg": f"Missing required fields: {', '.join(missing)}"}],
+        )
+
+    merged_payload = migrate_demo_payload(dict(payload))
+    merged_payload["id"] = demo_id
+    merged_payload["slug"] = existing.slug
+    merged_payload["createdAt"] = existing.createdAt
+    merged_payload["updatedAt"] = now_iso()
+    if not merged_payload.get("title"):
+        merged_payload["title"] = existing.title or "Untitled Demo"
+    if not merged_payload.get("status"):
+        merged_payload["status"] = existing.status
+
+    try:
+        demo = Demo.model_validate(merged_payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=build_validation_error(exc)) from exc
+
+    demo_store.update(demo)
+    return JSONResponse(demo.model_dump())
+
+
+@app.get("/api/demos/{slug}")
+def get_demo(slug: str) -> JSONResponse:
+    demo = demo_store.get_by_slug(slug)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+    return JSONResponse(demo.model_dump())
+
+
+@app.get("/api/demos/{demo_id}/export")
+def export_demo(demo_id: str) -> JSONResponse:
+    demo = demo_store.get_by_id(demo_id)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+    return JSONResponse(demo.model_dump())
+
+
+@app.post("/api/demos/import")
+async def import_demo(request: Request) -> JSONResponse:
+    payload = await request.json()
+    migrated = migrate_demo_payload(payload)
+    timestamp = now_iso()
+    imported = dict(migrated)
+    imported["id"] = str(uuid.uuid4())
+    imported["slug"] = unique_slug(imported.get("title") or "Imported Demo")
+    imported["title"] = imported.get("title") or "Imported Demo"
+    imported["createdAt"] = timestamp
+    imported["updatedAt"] = timestamp
+    imported["status"] = imported.get("status") or "draft"
+
+    try:
+        demo = Demo.model_validate(imported)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=build_validation_error(exc)) from exc
+
+    demo_store.create(demo)
+    return JSONResponse(demo.model_dump())
+
+
+@app.post("/api/uploads")
+async def upload_media(file: UploadFile = File(...)) -> JSONResponse:
+    result = await media_store.save_upload(file)
+    return JSONResponse(
+        {
+            "mediaType": result.media_type,
+            "mediaUrl": result.media_url,
+            "imageUrl": result.image_url,
+        }
+    )
+
+
+@app.post("/api/demos/{demo_id}/auto-build")
+async def auto_build_demo(demo_id: str, body: AutoBuildRequest) -> JSONResponse:
+    demo = demo_store.get_by_id(demo_id)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+
+    screen = next((item for item in demo.screens if item.id == body.screenId), None)
+    if not screen:
+        raise HTTPException(status_code=422, detail="screenId does not exist in this demo")
+    if screen.mediaType != "video":
+        raise HTTPException(status_code=422, detail="Auto build currently supports video screens only")
+
+    frames = [
+        {"timeSec": frame.timeSec, "imageBase64": frame.imageBase64}
+        for frame in sorted(body.frames, key=lambda item: item.timeSec)
+    ]
+    if sum(len(frame["imageBase64"]) for frame in frames) > 20_000_000:
+        raise HTTPException(status_code=413, detail="Frame payload too large")
+
+    for frame in frames:
+        try:
+            base64.b64decode(frame["imageBase64"], validate=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise HTTPException(status_code=422, detail="Invalid frame imageBase64 payload") from exc
+
+    auto_build_mode = "ai"
+    auto_build_reason = ""
+    try:
+        chapter_draft, step_draft = await _openai_auto_build(demo, frames)
+    except Exception as exc:
+        chapter_draft, step_draft = _fallback_auto_build(frames)
+        auto_build_mode = "fallback"
+        auto_build_reason = str(exc).strip() or "AI call failed"
+
+    if not step_draft:
+        raise HTTPException(status_code=422, detail="Auto build could not produce any steps")
+
+    try:
+        validated = _apply_auto_build_draft(
+            demo=demo,
+            screen_id=screen.id,
+            duration=screen.duration,
+            overwrite=body.overwrite,
+            chapter_draft=chapter_draft,
+            step_draft=step_draft,
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=build_validation_error(exc)) from exc
+
+    demo_store.update(validated)
+    response = JSONResponse(validated.model_dump())
+    response.headers["X-Autobuild-Mode"] = auto_build_mode
+    if auto_build_reason:
+        sanitized_reason = re.sub(r"[\r\n]+", " ", auto_build_reason)[:220]
+        response.headers["X-Autobuild-Reason"] = sanitized_reason
+    return response
+
+
+@app.post("/api/demos/{demo_id}/auto-build/from-draft")
+async def auto_build_from_draft(demo_id: str, body: AutoBuildDraftRequest) -> JSONResponse:
+    demo = demo_store.get_by_id(demo_id)
+    if not demo:
+        raise HTTPException(status_code=404, detail="Demo not found")
+
+    screen = next((item for item in demo.screens if item.id == body.screenId), None)
+    if not screen:
+        raise HTTPException(status_code=422, detail="screenId does not exist in this demo")
+
+    chapter_draft = [item.model_dump() for item in body.chapters]
+    step_draft = [item.model_dump() for item in body.steps]
+    if not step_draft:
+        raise HTTPException(status_code=422, detail="Draft must include at least one step")
+
+    try:
+        validated = _apply_auto_build_draft(
+            demo=demo,
+            screen_id=screen.id,
+            duration=screen.duration,
+            overwrite=body.overwrite,
+            chapter_draft=chapter_draft,
+            step_draft=step_draft,
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=build_validation_error(exc)) from exc
+
+    demo_store.update(validated)
+    response = JSONResponse(validated.model_dump())
+    response.headers["X-Autobuild-Mode"] = "codex-draft"
+    return response

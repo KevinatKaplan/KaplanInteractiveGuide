@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Builder | Interactive Guide</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Merriweather:wght@700&family=Noto+Sans:wght@400;600;700&family=Open+Sans:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/brand.css?v={{ asset_v }}" />
+    <link rel="stylesheet" href="/static/app.css?v={{ asset_v }}" />
+  </head>
+  <body class="builder theme-surface-page">
+    <header class="topbar">
+      <div class="brand-area">
+        <img class="brand-logo" src="/static/kaplan-pathways-logo.svg" alt="Kaplan International Pathways" />
+      </div>
+      <div class="top-meta">
+        <input id="demo-title" class="title-input" type="text" placeholder="Demo title" />
+        <div class="slug-row">Slug: <span id="demo-slug">-</span></div>
+      </div>
+      <div class="top-actions">
+        <div id="save-status" class="save-status">Saved</div>
+        <button id="save-demo" class="btn ghost">Save</button>
+        <button id="preview-demo" class="btn ghost">Preview</button>
+        <button id="new-demo" class="btn ghost">New Demo</button>
+        <button id="export-json" class="btn ghost">Export JSON</button>
+        <label class="btn ghost upload-btn">
+          Import JSON
+          <input id="import-json" type="file" accept="application/json" />
+        </label>
+        <button id="publish-demo" class="btn primary">Publish</button>
+      </div>
+    </header>
+
+    <main class="builder-layout">
+      <aside class="panel steps-panel">
+        <div class="panel-header">Steps</div>
+        <div id="quickstart-panel" class="quickstart-panel">
+          <div class="quickstart-header">
+            <h2>Quick Start</h2>
+            <button id="dismiss-quickstart" class="quickstart-close" type="button">Dismiss</button>
+          </div>
+          <ol>
+            <li>Upload an image or video.</li>
+            <li>Add your first step.</li>
+            <li>Draw and test a hotspot.</li>
+            <li>Preview and publish.</li>
+          </ol>
+        </div>
+        <button id="add-step" class="btn ghost full">Add Step</button>
+        <button id="add-hotspot" class="btn ghost full">Add Hotspot (Same Frame)</button>
+        <button id="add-chapter" class="btn ghost full">Add Chapter</button>
+        <div id="step-empty-state" class="inline-empty hidden">No steps yet. Add first step.</div>
+        <div id="chapters-list" class="chapters-list"></div>
+        <div id="steps-list" class="steps-list"></div>
+      </aside>
+
+      <section class="canvas-panel">
+        <div class="canvas-toolbar">
+          <label class="field">
+            <span>Screenshot</span>
+            <select id="screen-select"></select>
+          </label>
+          <label class="upload-btn btn ghost">
+            Upload Media
+            <input id="screen-upload" type="file" accept="image/*,video/*" multiple />
+          </label>
+          <button id="remove-screen" class="btn ghost">Remove Screen</button>
+          <button id="record-screen" class="btn ghost">Record Screen</button>
+          <button id="stop-record" class="btn ghost hidden">Stop Recording</button>
+          <button id="auto-build-ai" class="btn ghost">Auto Build (AI)</button>
+          <button id="export-codex-pack" class="btn ghost">Export For Codex</button>
+          <label class="upload-btn btn ghost">
+            Import Codex Draft
+            <input id="import-codex-draft" type="file" accept="application/json" />
+          </label>
+        </div>
+        <div class="canvas-wrap">
+          <div id="canvas-empty" class="empty-state">Upload a screenshot to start.</div>
+          <div id="image-stage" class="image-stage hidden">
+            <div id="builder-hint-layer" class="hint-layer">
+              <img id="screen-image" alt="Selected screenshot" />
+              <video id="screen-video" class="hidden" playsinline muted></video>
+              <div id="dim-overlay" class="dim-overlay"></div>
+              <div id="hotspot-box" class="hotspot-box">
+                <span class="resize-handle nw" data-handle="nw"></span>
+                <span class="resize-handle ne" data-handle="ne"></span>
+                <span class="resize-handle sw" data-handle="sw"></span>
+                <span class="resize-handle se" data-handle="se"></span>
+              </div>
+              <div id="builder-cursor" class="demo-cursor hidden"></div>
+              <div id="builder-arrow" class="arrow-hint hidden"></div>
+            </div>
+            <div id="draw-rect" class="draw-rect"></div>
+          </div>
+        </div>
+        <div id="video-controls" class="video-controls hidden">
+          <button id="video-play" class="btn ghost">Play</button>
+          <button id="video-pause" class="btn ghost">Pause</button>
+          <div class="video-scrub-wrap">
+            <div id="video-marker-track" class="video-marker-track" aria-hidden="true"></div>
+            <input id="video-scrub" type="range" min="0" max="0" step="0.01" value="0" />
+          </div>
+          <div id="video-time" class="video-time">0.00s</div>
+          <button id="set-step-time" class="btn ghost">Set Step Time</button>
+          <button id="add-video-marker" class="btn ghost">Add Marker</button>
+          <button id="clear-video-markers" class="btn ghost">Clear Markers</button>
+        </div>
+      </section>
+
+      <aside class="panel settings-panel">
+        <div class="panel-header">Step Settings</div>
+        <label class="field">
+          <span>Title</span>
+          <input id="step-title" type="text" placeholder="Step title" />
+        </label>
+        <label class="field">
+          <span>Body</span>
+          <textarea id="step-body" rows="4" placeholder="Optional guidance text"></textarea>
+        </label>
+        <label class="field">
+          <span>Next Step</span>
+          <select id="next-step"></select>
+        </label>
+        <label class="field">
+          <span>Chapter</span>
+          <select id="step-chapter"></select>
+        </label>
+        <label class="field">
+          <span>Hotspot Style</span>
+          <select id="hotspot-type">
+            <option value="click">Click hotspot</option>
+            <option value="highlight">Highlight hotspot</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Hint</span>
+          <select id="hint-type">
+            <option value="click">Click hint</option>
+            <option value="arrow">Arrow hint</option>
+            <option value="none">No hint</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Tooltip Position</span>
+          <select id="tooltip-position">
+            <option value="auto">Auto</option>
+            <option value="right">Right</option>
+            <option value="left">Left</option>
+            <option value="bottom">Bottom</option>
+            <option value="top">Top</option>
+          </select>
+        </label>
+        <label class="field row-field">
+          <input id="focus-mode" type="checkbox" />
+          <span>Focus mode</span>
+        </label>
+        <label class="field row-field">
+          <input id="snap-edges" type="checkbox" checked />
+          <span>Snap to edges</span>
+        </label>
+        <label class="field row-field">
+          <input id="test-hotspot" type="checkbox" />
+          <span>Test hotspot mode</span>
+        </label>
+        <button id="clear-hotspot" class="btn ghost full">Clear Hotspot</button>
+        <div id="hotspot-readout" class="hotspot-readout">Draw a hotspot on the screenshot.</div>
+        <div id="step-time-readout" class="hotspot-readout hidden">Video time: --</div>
+        <div class="panel-header">Intro Screen</div>
+        <label class="field row-field">
+          <input id="intro-enabled" type="checkbox" checked />
+          <span>Show intro before steps</span>
+        </label>
+        <label class="field">
+          <span>Intro title</span>
+          <input id="intro-title" type="text" placeholder="Interactive Product Tour" />
+        </label>
+        <label class="field">
+          <span>Intro body</span>
+          <textarea id="intro-body" rows="3" placeholder="Short welcome text for users"></textarea>
+        </label>
+        <label class="field">
+          <span>Start button label</span>
+          <input id="intro-start-label" type="text" placeholder="Start Interactive Demo" />
+        </label>
+        <label class="field">
+          <span>Skip button label</span>
+          <input id="intro-skip-label" type="text" placeholder="Skip Intro" />
+        </label>
+        <div id="publish-panel" class="publish-panel hidden">
+          <div class="publish-title">Share Link</div>
+          <input id="share-url" readonly />
+          <div class="publish-title">Embed Snippet</div>
+          <textarea id="embed-snippet" rows="3" readonly></textarea>
+        </div>
+      </aside>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <div id="start-modal" class="modal">
+      <div class="modal-card">
+        <h2>Create a new demo</h2>
+        <p>Give your demo a name to start building.</p>
+        <input id="start-title" type="text" placeholder="Demo title" />
+        <div class="modal-actions">
+          <button id="create-demo" class="btn primary">Create Demo</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/builder.js?v={{ asset_v }}"></script>
+  </body>
+</html>

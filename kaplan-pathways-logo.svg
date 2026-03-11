@@ -1,0 +1,76 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Showcase | Interactive Guide</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Merriweather:wght@700&family=Noto+Sans:wght@400;600;700&family=Open+Sans:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/brand.css?v={{ asset_v }}" />
+    <link rel="stylesheet" href="/static/app.css?v={{ asset_v }}" />
+  </head>
+  <body class="showcase-page theme-surface-page">
+    <main class="showcase-shell">
+      <header class="theme-header">
+        <a href="/" class="theme-brand">
+          <img src="/static/kaplan-pathways-logo.svg" alt="Kaplan International Pathways" />
+        </a>
+        <nav class="theme-nav" aria-label="Primary">
+          <a href="/builder">Builder</a>
+          <a href="/showcase/all">Showcase</a>
+          <a href="/admin">Admin</a>
+        </nav>
+      </header>
+
+      <header class="showcase-header">
+        <h1>Showcase: {{ slug }}</h1>
+        <p>Browse demos and open any walkthrough in a standalone player.</p>
+      </header>
+
+      <form class="showcase-filters" method="get">
+        <label class="field">
+          Search
+          <input type="text" name="q" value="{{ q }}" placeholder="Search by title, slug, or tag" />
+        </label>
+        <label class="field">
+          Tag
+          <select name="tag">
+            <option value="">All tags</option>
+            {% for value in tags %}
+            <option value="{{ value }}" {% if value == tag %}selected{% endif %}>{{ value }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button class="btn primary" type="submit">Apply</button>
+      </form>
+
+      <section class="showcase-grid">
+        {% if cards %}
+        {% for card in cards %}
+        <article class="showcase-card">
+          <div class="showcase-card-header">
+            <h2>{{ card.title }}</h2>
+            <span class="showcase-status">{{ card.status }}</span>
+          </div>
+          <div class="showcase-meta">{{ card.stepCount }} steps &middot; {{ card.slug }}</div>
+          <div class="showcase-tags">
+            {% for tag_value in card.tags %}
+            <span class="showcase-tag">{{ tag_value }}</span>
+            {% endfor %}
+          </div>
+          <div class="showcase-actions">
+            <a class="btn primary" href="/demo/{{ card.slug }}" target="_blank" rel="noopener noreferrer">Open Demo</a>
+          </div>
+        </article>
+        {% endfor %}
+        {% else %}
+        <div class="inline-empty">No demos match this filter.</div>
+        {% endif %}
+      </section>
+    </main>
+  </body>
+</html>
